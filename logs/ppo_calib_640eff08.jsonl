@@ -1,0 +1,1 @@
+{"event": "reset", "run_id": "640eff08", "ep": 1, "seed": 8506242, "theta_true": {"battery_max": 30.0, "step_cost": 0.1}, "theta_est": {"grid_size": 10, "use_stay": false, "battery_max": 80, "step_cost": 0.1, "delivery_reward": 10.0, "battery_fail_penalty": 8.0, "p_slip": 0.1}, "gt_has_pslip": false}

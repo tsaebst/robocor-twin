@@ -1,0 +1,23 @@
+{
+  "run_id": "ecce9840f0",
+  "init_theta": {
+    "battery_max": 30,
+    "step_cost": 0.1,
+    "battery_fail_penalty": 5.0
+  },
+  "best_theta": {
+    "battery_max": 291,
+    "step_cost": 0.1018787807066146,
+    "battery_fail_penalty": 13.450532678337385
+  },
+  "metrics_init": {
+    "bat_mse": 0.24484722010259924,
+    "rew_gap": 4.999999999999999,
+    "loss": 0.7448472201025992
+  },
+  "metrics_best": {
+    "bat_mse": 0.03267833573394836,
+    "rew_gap": 4.6242438586770795,
+    "loss": 0.4951027216016563
+  }
+}
