@@ -3,16 +3,18 @@ from __future__ import annotations
 import json
 import math
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 
 import numpy as np
 import gymnasium as gym
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 
 from env import RCConfig, make_env
-from rc_calib.wrappers import SlipActionWrapper 
-
+from src.rc_calib.wrappers import SlipActionWrapper
+from metrics import CalibBatch, compute_loss_components, compute_accuracy_metrics
 from rl_utils import (
     RoboCourierOracle,
     Theta, clamp_theta, theta_to_dict,
@@ -21,8 +23,20 @@ from rl_utils import (
     apply_theta_to_env,
 )
 
-# Heuristic driver
+# Multi-loss weights (slip intentionally disabled by default)
+LOSS_WEIGHTS = {"pos": 1.0, "bat": 2.0, "rew": 1.0, "term": 1.0, "slip": 0.0}
+CALIB_BATCH_LEN = 32
+HUBER_DELTA = 1.0
+
+# Logging
+LOG_UPDATE_ONLY = True
+LOG_STEPS = False  # True only for debugging
+
+
+# Utilities
+
 def a5_driver_action(obs: np.ndarray, grid_size: int, act_map: Dict[str, int], charge_thresh: float = 0.30) -> int:
+    """A5-like heuristic driver used to generate actions in the environment."""
     has = float(obs[6]) > 0.5
     bat = float(obs[7])
     rx, ry = obs_to_robot_xy(obs, grid_size)
@@ -37,21 +51,118 @@ def a5_driver_action(obs: np.ndarray, grid_size: int, act_map: Dict[str, int], c
         target = (dx, dy) if has else (px, py)
     return greedy_action_towards((rx, ry), target, act_map)
 
-# Safe JSON
-def _sanitize(obj: Any) -> Any:
+
+def _sanitize_json(obj: Any) -> Any:
     if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None
     if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
+        return {k: _sanitize_json(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_sanitize(v) for v in obj]
+        return [_sanitize_json(v) for v in obj]
     return obj
 
-def json_dumps_safe(obj: Any) -> str:
-    return json.dumps(_sanitize(obj), ensure_ascii=False)
 
-# PPO chooses quer+theta deltas
+def json_dumps_safe(obj: Any) -> str:
+    return json.dumps(_sanitize_json(obj), ensure_ascii=False)
+
+
+def _is_valid_gt(x: Any) -> bool:
+    if x is None:
+        return False
+    if isinstance(x, float) and math.isnan(x):
+        return False
+    return True
+
+
+# Ring buffer for paired oracle transitions
+@dataclass
+class PairTransition:
+    twin_pos_next: np.ndarray   # [2]
+    oracle_pos_next: np.ndarray # [2]
+    twin_bat_next: float
+    oracle_bat_next: float
+    twin_rew: float
+    oracle_rew: float
+    twin_done: int
+    oracle_done: int
+
+
+class RingBuffer:
+    def __init__(self, capacity: int):
+        self.capacity = int(capacity)
+        self._buf: List[PairTransition] = []
+
+    def append(self, x: PairTransition) -> None:
+        self._buf.append(x)
+        if len(self._buf) > self.capacity:
+            self._buf.pop(0)
+
+    def tail(self, n: int) -> List[PairTransition]:
+        n = int(n)
+        if n <= 0:
+            return []
+        return self._buf[-n:]
+
+    def __len__(self) -> int:
+        return len(self._buf)
+
+
+# --- NEW: eval callback -------------------------------------------------------
+
+class CalibEvalCallback(BaseCallback):
+    """
+    Runs periodic held-out evaluation episodes (no learning update).
+    The eval env logs to the same jsonl with log_mode='eval'.
+    """
+    def __init__(
+        self,
+        eval_env: gym.Env,
+        eval_seeds: List[int],
+        eval_freq: int = 5000,
+        n_eval_episodes: int = 5,
+        deterministic: bool = True,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.eval_seeds = list(eval_seeds)
+        self.eval_freq = int(eval_freq)
+        self.n_eval_episodes = int(n_eval_episodes)
+        self.deterministic = bool(deterministic)
+
+    def _on_step(self) -> bool:
+        if self.eval_freq <= 0:
+            return True
+        if (self.num_timesteps % self.eval_freq) != 0:
+            return True
+
+        # run held-out episodes
+        base = (self.num_timesteps // self.eval_freq) * self.n_eval_episodes
+        for i in range(self.n_eval_episodes):
+            seed = int(self.eval_seeds[(base + i) % len(self.eval_seeds)])
+            obs, _ = self.eval_env.reset(seed=seed)
+            done = False
+            while not done:
+                action, _ = self.model.predict(obs, deterministic=self.deterministic)
+                obs, reward, done, trunc, info = self.eval_env.step(action)
+                done = bool(done or trunc)
+        return True
+
+
+# ControllerEnv
 class ControllerEnv(gym.Env):
+    """
+    PPO controller chooses:
+      action[0] = query gate (q_raw)
+      action[1] = delta for battery_max
+      action[2] = delta for step_cost
+      action[3] = delta for p_slip
+
+    Only applies theta updates on oracle queries.
+    Computes batch loss over last CALIB_BATCH_LEN oracle transitions.
+    Logs update-only records for clean plots.
+    """
+
     metadata = {"render_modes": []}
 
     def __init__(
@@ -64,64 +175,70 @@ class ControllerEnv(gym.Env):
         K: int = 200,
         query_every: int = 20,
         sleep_s: float = 0.0,
-
-        # reward weights 
-        w_pos: float = 1.0,
-        w_bat: float = 1.0,
-        w_rew: float = 0.1,
-
-        # query cost
-        query_cost_base: float = 0.05,
-        query_cost_freq: float = 0.10,   # extra cost when querying too frequently
-
-        # small step penalty
+        query_cost_base: float = 0.10,
         step_penalty: float = 0.001,
-
-        # driver heuristic param
+        theta_reg: float = 0.15,
         charge_thresh: float = 0.30,
-
-        init_theta: Optional[Theta] = None,):
+        init_theta: Optional[Theta] = None,
+        prior_theta: Optional[Theta] = None,
+        # --- NEW:
+        mode: str = "train",          # 'train' or 'eval'
+        log_mode: Optional[str] = None,  # tag written to jsonl, defaults to mode
+        freeze_theta: bool = False,   # for eval/ablation: prevent applying theta deltas
+    ):
         super().__init__()
+        self.prev_loss_total: Optional[float] = None
         self.oracle = RoboCourierOracle(oracle_url)
         self.seed0 = int(seed0)
+
+        self.mode = str(mode)
+        self.log_mode = str(log_mode) if (log_mode is not None) else str(mode)
+        self.freeze_theta = bool(freeze_theta)
 
         self.H = int(H)
         self.K = int(K)
         self.query_every = int(query_every)
         self.sleep_s = float(sleep_s)
 
-        self.w_pos = float(w_pos)
-        self.w_bat = float(w_bat)
-        self.w_rew = float(w_rew)
-
         self.query_cost_base = float(query_cost_base)
-        self.query_cost_freq = float(query_cost_freq)
         self.step_penalty = float(step_penalty)
-
+        self.theta_reg = float(theta_reg)
         self.charge_thresh = float(charge_thresh)
 
-        # logging
+        # Multi-loss config
+        self.loss_weights = dict(LOSS_WEIGHTS)
+        self.huber_delta = float(HUBER_DELTA)
+        self.batch_len = int(CALIB_BATCH_LEN)
+        self.min_T = max(8, self.batch_len // 2)  # soft gate for early updates
+
+        # Logging
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_f = self.log_path.open("w", encoding="utf-8")
+        self._log_f = self.log_path.open("a", encoding="utf-8")  # <-- append, so eval can share file
 
-        # action mapping
+        # Action mapping
         self.act_map = infer_action_mapping_local(seed=self.seed0)
 
-        # driver model
+        # Driver model
         self.driver_is_heuristic = (driver_model_path is None)
         self.driver_model = PPO.load(driver_model_path) if (not self.driver_is_heuristic) else None
 
-        # controller action q_raw, d_bmax, d_step_cost, d_deliv, d_fail, d_pslip
-        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
+        # Controller action space
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
 
-        # observation twin_obs(10) + theta(5) + budget_frac(1) + since_query(1) + last_err(3)
-        self.observation_space = gym.spaces.Box(low=-10.0, high=10.0, shape=(10 + 5 + 1 + 1 + 3,), dtype=np.float32)
+        # twin_obs(10) + theta(3) + budget_frac(1) + since_query(1) + last_acc(4)
+        self.observation_space = gym.spaces.Box(
+            low=-10.0, high=10.0, shape=(10 + 3 + 1 + 1 + 4,), dtype=np.float32
+        )
 
         self.theta = init_theta if init_theta is not None else Theta()
+        self.theta_prior = prior_theta if prior_theta is not None else Theta(
+            battery_max=80, step_cost=0.10, delivery_reward=10.0, battery_fail_penalty=8.0, p_slip=0.10
+        )
+
         self._rng = np.random.default_rng(self.seed0)
 
-        # runtime state
+        # Runtime state
         self.sid: Optional[str] = None
         self.grid_size: int = 10
 
@@ -131,32 +248,63 @@ class ControllerEnv(gym.Env):
 
         self.k_used_ep: int = 0
         self.k_used_total: int = 0
-
         self.since_query: int = 10**9
-        self.last_err = np.zeros(3, dtype=np.float32)
+
+        # never store NaN here
+        self.last_acc = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
         self.obs_t: Optional[np.ndarray] = None
         self.twin = None
 
-        # oracle GT theta subset
+        # Oracle GT theta (subset)
         self.theta_true: Dict[str, Any] = {}
-        self.gt_has_pslip: bool = False  # auto-detected each episode
+        self.gt_has_pslip: bool = False
 
-        # loss tracking for improvement reward
-        self.prev_loss: Optional[float] = None
+        # Buffer of paired oracle transitions
+        self.pair_buf = RingBuffer(capacity=max(256, self.batch_len * 4))
 
-    # Build twin env
+        # Update index for queries
+        self.update_idx: int = 0
+
+    # Safe observation
+    def _sanitize_obs(self, vec: np.ndarray, where: str) -> np.ndarray:
+        vec = np.asarray(vec, dtype=np.float32)
+        if np.all(np.isfinite(vec)):
+            return vec
+
+        bad = np.where(~np.isfinite(vec))[0].tolist()
+        rec = {
+            "event": "warning",
+            "mode": self.mode,
+            "log_mode": self.log_mode,
+            "where": where,
+            "t_global": int(self.t_global),
+            "ep": int(self.ep),
+            "t_ep": int(self.t_ep),
+            "bad_idx": bad,
+            "bad_values": [None if not np.isfinite(float(vec[i])) else float(vec[i]) for i in bad],
+            "theta_est": theta_to_dict(self.theta),
+            "last_acc": [float(x) for x in np.nan_to_num(self.last_acc, nan=0.0, posinf=0.0, neginf=0.0).tolist()],
+        }
+        self._log_f.write(json_dumps_safe(rec) + "\n")
+        self._log_f.flush()
+
+        return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    # Twin env builder
     def _make_twin(self, seed: int) -> Any:
         cfg = RCConfig(
             seed=seed,
             grid_size=int(self.theta.grid_size),
             battery_max=int(self.theta.battery_max),
             step_cost=float(self.theta.step_cost),
-            delivery_reward=float(self.theta.delivery_reward),
-            battery_fail_penalty=float(self.theta.battery_fail_penalty),
+            delivery_reward=float(self.theta.delivery_reward),            # fixed
+            battery_fail_penalty=float(self.theta.battery_fail_penalty),  # fixed
             use_stay=bool(self.theta.use_stay),
         )
         base = make_env(cfg)
+
+        # Optional slip wrapper
         try:
             twin = SlipActionWrapper(base, p_slip=float(self.theta.p_slip), seed=seed)
             return twin
@@ -165,21 +313,26 @@ class ControllerEnv(gym.Env):
 
     def _obs_vec(self) -> np.ndarray:
         th = self.theta
+
+        # normalize theta components
         theta_vec = np.array(
             [
                 float(th.battery_max) / 400.0,
-                float(th.step_cost),
-                float(th.delivery_reward) / 20.0,
-                float(th.battery_fail_penalty) / 25.0,
+                float(th.step_cost) / 0.50,
                 float(th.p_slip) / 0.30,
             ],
             dtype=np.float32,
         )
-        budget_frac = np.array([float(self.K - self.k_used_ep) / max(1.0, float(self.K))], dtype=np.float32)
+
+        budget_frac = np.array(
+            [float(self.K - self.k_used_ep) / max(1.0, float(self.K))],
+            dtype=np.float32,
+        )
         since_q = np.array([min(1.0, float(self.since_query) / 200.0)], dtype=np.float32)
 
         obs = np.asarray(self.obs_t, dtype=np.float32)
-        return np.concatenate([obs, theta_vec, budget_frac, since_q, self.last_err], axis=0)
+        vec = np.concatenate([obs, theta_vec, budget_frac, since_q, self.last_acc], axis=0)
+        return vec
 
     def _driver_action(self, obs_t: np.ndarray) -> int:
         if self.driver_is_heuristic:
@@ -187,56 +340,36 @@ class ControllerEnv(gym.Env):
         a, _ = self.driver_model.predict(obs_t, deterministic=True)
         return int(a)
 
-    # Metrics theta vs GT with auto-excluding p_slip if GT missing
-    def _theta_metrics(self) -> Dict[str, float]:
-        eps = 1e-6
-        # only parameters with valid GT
-        keys: List[str] = ["battery_max", "step_cost"]
-        if self.gt_has_pslip:
-            keys.append("p_slip")
+    def _theta_reg_penalty(self) -> float:
+        th = self.theta
+        pr = self.theta_prior
+        db = ((float(th.battery_max) - float(pr.battery_max)) / 400.0) ** 2
+        ds = ((float(th.step_cost) - float(pr.step_cost)) / 0.50) ** 2
+        dp = ((float(th.p_slip) - float(pr.p_slip)) / 0.30) ** 2
+        return float(self.theta_reg * (db + ds + dp))
 
-        tru = self.theta_true
-        est = theta_to_dict(self.theta)
+    def _adaptive_query_cost(self, acc_parts: Dict[str, float]) -> float:
+        theta_ma = acc_parts.get("acc/theta_mean_abs", 0.0)
+        pos_mse = acc_parts.get("acc/pos_mse", 0.0)
+        bat_mse = acc_parts.get("acc/bat_mse", 0.0)
+        rew_mae = acc_parts.get("acc/rew_mae", 0.0)
 
-        #bounds for normalized L2 
-        #must match clamp ranges
-        bounds = {
-            "battery_max": (30.0, 400.0),
-            "step_cost": (0.01, 0.50),
-            "p_slip": (0.0, 0.30),
-        }
+        # sanitize NaNs
+        if isinstance(theta_ma, float) and math.isnan(theta_ma): theta_ma = 0.0
+        if isinstance(pos_mse, float) and math.isnan(pos_mse): pos_mse = 0.0
+        if isinstance(bat_mse, float) and math.isnan(bat_mse): bat_mse = 0.0
+        if isinstance(rew_mae, float) and math.isnan(rew_mae): rew_mae = 0.0
 
-        rpes = []
-        n_est = []
-        n_tru = []
-        for k in keys:
-            tv = float(tru[k])
-            ev = float(est[k])
-            rpes.append(abs(ev - tv) / (abs(tv) + eps))
-            lo, hi = bounds[k]
-            n_est.append((ev - lo) / (hi - lo))
-            n_tru.append((tv - lo) / (hi - lo))
+        bad = 0.0
+        bad += float(theta_ma)
+        bad += 0.05 * float(pos_mse)
+        bad += 0.05 * float(bat_mse)
+        bad += 0.10 * float(rew_mae)
 
-        mean_rpe = float(np.mean(rpes)) if rpes else float("nan")
-        n_l2 = float(np.linalg.norm(np.array(n_est) - np.array(n_tru))) if rpes else float("nan")
-
-        return {
-            "mean_rpe": mean_rpe,
-            "n_l2": n_l2,
-        }
-
-    # Loss for improvement reward
-    def _loss_from_err(self, pos_mse: float, bat_mse: float, rew_abs_err: float) -> float:
-        return float(self.w_pos * pos_mse + self.w_bat * bat_mse + self.w_rew * rew_abs_err)
-
-    def _query_cost(self) -> float:
-        #  querying right after a query costs more
-        # since_query < query_every -> extra cost close to query_cost_freq
-        if self.since_query >= self.query_every:
-            extra = 0.0
-        else:
-            extra = self.query_cost_freq * (1.0 - (self.since_query / max(1.0, float(self.query_every))))
-        return float(self.query_cost_base + extra)
+        # Keep >0 for stability
+        min_cost = 0.01 * float(self.query_cost_base)
+        cost = float(self.query_cost_base) / (1.0 + bad)
+        return float(np.clip(cost, min_cost, float(self.query_cost_base)))
 
     # Gym API
     def reset(self, seed: int | None = None, options=None):
@@ -247,8 +380,9 @@ class ControllerEnv(gym.Env):
         self.t_ep = 0
         self.k_used_ep = 0
         self.since_query = 10**9
-        self.last_err = np.zeros(3, dtype=np.float32)
-        self.prev_loss = None
+        self.last_acc = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        self.pair_buf = RingBuffer(capacity=max(256, self.batch_len * 4))
+        self.update_idx = 0
 
         r = self.oracle.reset(seed=seed, config_overrides=None)
         self.sid = r["session_id"]
@@ -259,42 +393,37 @@ class ControllerEnv(gym.Env):
         self.theta.use_stay = bool(ws.get("use_stay", self.theta.use_stay))
         clamp_theta(self.theta)
 
-        # extract theta_true; p_slip may be absent/NaN
+        # Extract GT subset
         bm = ws.get("battery_max", None)
         sc = ws.get("step_cost", None)
         ps = ws.get("p_slip", None)
 
-        def _is_valid(x):
-            if x is None:
-                return False
-            if isinstance(x, float) and math.isnan(x):
-                return False
-            return True
-
         self.theta_true = {}
-        if _is_valid(bm):
+        if _is_valid_gt(bm):
             self.theta_true["battery_max"] = float(bm)
-        if _is_valid(sc):
+        if _is_valid_gt(sc):
             self.theta_true["step_cost"] = float(sc)
 
-        self.gt_has_pslip = _is_valid(ps)
+        self.gt_has_pslip = _is_valid_gt(ps)
         if self.gt_has_pslip:
             self.theta_true["p_slip"] = float(ps)
 
-        # twin
+        # Twin reset
         self.twin = self._make_twin(seed=seed)
         obs0, _ = self.twin.reset(seed=seed)
         self.obs_t = np.asarray(obs0, dtype=np.float32)
 
-        # log reset event
+        # Log reset
         self._log_f.write(
             json_dumps_safe(
                 {
                     "event": "reset",
+                    "mode": self.mode,
+                    "log_mode": self.log_mode,
                     "run_id": getattr(self, "run_id", None),
                     "ep": self.ep,
                     "seed": int(seed),
-                    "theta_true": self.theta_true | {"p_slip": (float(ps) if self.gt_has_pslip else None)},
+                    "theta_true": dict(self.theta_true),
                     "theta_est": theta_to_dict(self.theta),
                     "gt_has_pslip": bool(self.gt_has_pslip),
                 }
@@ -303,122 +432,236 @@ class ControllerEnv(gym.Env):
         )
         self._log_f.flush()
 
-        return self._obs_vec(), {}
+        obs_vec = self._sanitize_obs(self._obs_vec(), where="reset/obs_vec")
+        return obs_vec, {}
 
     def step(self, action: np.ndarray):
+        import time
+
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         q_raw = float(action[0])
 
-        #controller may propose query, but we enforce min interval + budget
         query_allowed = (self.since_query >= self.query_every) and (self.k_used_ep < self.K)
         do_query = int((q_raw > 0.0) and query_allowed)
 
-        # driver step
-        a_move = self._driver_action(np.asarray(self.obs_t, dtype=np.float32))
-        obs_t2, r_t, term, trunc, _ = self.twin.step(int(a_move))
-        self.obs_t = np.asarray(obs_t2, dtype=np.float32)
+        obs_prev = np.asarray(self.obs_t, dtype=np.float32)
+        a_move = self._driver_action(obs_prev)
 
-        # default reward: time penalty
+        obs_t2, r_t, term, trunc, _info_t = self.twin.step(int(a_move))
+        obs_t2 = np.asarray(obs_t2, dtype=np.float32)
+        self.obs_t = obs_t2
+
         reward = -float(self.step_penalty)
 
-        #compute/update only on query
-        update_rec = None
-        if do_query:
-            resp = self.oracle.step(self.sid, int(a_move))
-            obs_o = np.asarray(resp["obs"], dtype=np.float32)
-            r_o = float(resp["reward"])
+        # NO QUERY PATH
+        if not do_query:
+            self.since_query += 1
+            self.t_ep += 1
+            self.t_global += 1
 
-            pos_mse = float(np.mean((obs_o[0:2] - self.obs_t[0:2]) ** 2))
-            bat_mse = float((obs_o[7] - self.obs_t[7]) ** 2)
-            rew_abs_err = float(abs(r_o - float(r_t)))
+            done = bool(term or trunc or (self.t_ep >= self.H))
 
-            self.last_err = np.array([pos_mse, bat_mse, rew_abs_err], dtype=np.float32)
+            if (not LOG_UPDATE_ONLY) and LOG_STEPS:
+                self._log_f.write(
+                    json_dumps_safe({
+                        "event": "step",
+                        "mode": self.mode,
+                        "log_mode": self.log_mode,
+                        "t_global": int(self.t_global),
+                        "ep": int(self.ep),
+                        "t_ep": int(self.t_ep),
+                        "did_query": 0,
+                        "k_used_ep": int(self.k_used_ep),
+                        "k_used_total": int(self.k_used_total),
+                        "since_query": int(self.since_query),
+                        "theta_est": theta_to_dict(self.theta),
+                        "reward": float(reward),
+                    }) + "\n"
+                )
+                self._log_f.flush()
 
-            loss_new = self._loss_from_err(pos_mse, bat_mse, rew_abs_err)
-            if self.prev_loss is None:
-                improvement = 0.0
-            else:
-                improvement = float(self.prev_loss - loss_new)
-            self.prev_loss = float(loss_new)
+            obs_vec = self._sanitize_obs(self._obs_vec(), where="step/no_query_obs_vec")
+            return obs_vec, float(reward), done, False, {}
 
-            qcost = self._query_cost()
-            reward = float(improvement - qcost)
+        # QUERY PATH: STEP ORACLE
+        resp = self.oracle.step(self.sid, int(a_move))
 
-            # update theta ONLY on query
-            # if GT for p_slip is NaN -> still may keep p_slip in theta dynamics
-            # but do NOT include it in theta accuracy metrics
-            th = self.theta
-            th.battery_max = int(round(th.battery_max + 80.0 * float(action[1])))
-            th.step_cost = float(th.step_cost + 0.10 * float(action[2]))
-            th.delivery_reward = float(th.delivery_reward + 6.0 * float(action[3]))
-            th.battery_fail_penalty = float(th.battery_fail_penalty + 8.0 * float(action[4]))
-            th.p_slip = float(th.p_slip + 0.05 * float(action[5]))
+        obs_o = np.asarray(resp.get("obs", resp.get("observation", [])), dtype=np.float32)
+        r_o = float(resp.get("reward", 0.0))
 
-            clamp_theta(th)
-            self.theta = th
-            apply_theta_to_env(self.twin, self.theta)
+        oracle_done = int(bool(resp.get("done", False) or resp.get("terminated", False) or resp.get("truncated", False)))
+        twin_done = int(bool(term or trunc))
 
-            # counters
+        twin_pos_next = np.array([float(obs_t2[0]), float(obs_t2[1])], dtype=float)
+        oracle_pos_next = np.array([float(obs_o[0]), float(obs_o[1])], dtype=float)
+        twin_bat_next = float(obs_t2[7])
+        oracle_bat_next = float(obs_o[7])
+
+        self.pair_buf.append(PairTransition(
+            twin_pos_next=twin_pos_next,
+            oracle_pos_next=oracle_pos_next,
+            twin_bat_next=twin_bat_next,
+            oracle_bat_next=oracle_bat_next,
+            twin_rew=float(r_t),
+            oracle_rew=float(r_o),
+            twin_done=twin_done,
+            oracle_done=oracle_done,
+        ))
+
+        recent = self.pair_buf.tail(self.batch_len)
+        T = len(recent)
+
+        batch = CalibBatch(
+            pos_next_oracle=np.stack([x.oracle_pos_next for x in recent], axis=0) if T else np.zeros((0, 2)),
+            pos_next_twin=np.stack([x.twin_pos_next for x in recent], axis=0) if T else np.zeros((0, 2)),
+            bat_next_oracle=np.array([x.oracle_bat_next for x in recent], dtype=float) if T else np.zeros((0,)),
+            bat_next_twin=np.array([x.twin_bat_next for x in recent], dtype=float) if T else np.zeros((0,)),
+            reward_oracle=np.array([x.oracle_rew for x in recent], dtype=float) if T else np.zeros((0,)),
+            reward_twin=np.array([x.twin_rew for x in recent], dtype=float) if T else np.zeros((0,)),
+            done_oracle=np.array([x.oracle_done for x in recent], dtype=int) if T else np.zeros((0,), dtype=int),
+            done_twin=np.array([x.twin_done for x in recent], dtype=int) if T else np.zeros((0,), dtype=int),
+            slip_flag=None,
+        )
+
+        theta_est = theta_to_dict(self.theta)
+        theta_true = dict(self.theta_true)
+
+        loss_parts = compute_loss_components(batch, theta_est, self.loss_weights, huber_delta=self.huber_delta)
+
+        skip_theta_update = False
+        if self.prev_loss_total is not None:
+            if float(loss_parts.get("loss/total", 0.0)) > 1.2 * float(self.prev_loss_total):
+                skip_theta_update = True
+        self.prev_loss_total = float(loss_parts.get("loss/total", 0.0))
+
+        acc_parts = compute_accuracy_metrics(batch, theta_est, theta_true)
+
+        theta_ma = acc_parts.get("acc/theta_mean_abs", 0.0)
+        if isinstance(theta_ma, float) and math.isnan(theta_ma):
+            theta_ma = 0.0
+
+        self.last_acc = np.array([
+            float(acc_parts.get("acc/pos_mse", 0.0) or 0.0),
+            float(acc_parts.get("acc/bat_mse", 0.0) or 0.0),
+            float(acc_parts.get("acc/rew_mae", 0.0) or 0.0),
+            float(theta_ma),
+        ], dtype=np.float32)
+
+        qcost = float(self._adaptive_query_cost(acc_parts))
+
+        # Soft gate for insufficient batch
+        min_T = self.min_T
+        if T < min_T:
+            reg_pen = float(self._theta_reg_penalty())
+            reward = float(-qcost - reg_pen - self.step_penalty)
+
             self.k_used_ep += 1
             self.k_used_total += 1
             self.since_query = 0
+            self.update_idx += 1
 
-            # metrics
-            theta_metrics = self._theta_metrics()
-            update_rec = {
-                "event": "update",
+            self._log_f.write(json_dumps_safe({
+                "event": "oracle_update_skipped",
+                "mode": self.mode,
+                "log_mode": self.log_mode,
+                "run_id": getattr(self, "run_id", None),
+                "t_global": int(self.t_global),
+                "update_idx": int(self.update_idx),
+                "ep": int(self.ep),
+                "t_ep": int(self.t_ep),
+                "k_used_ep": int(self.k_used_ep),
+                "k_used_total": int(self.k_used_total),
+                "batch_T": int(T),
+                "reason": "insufficient_batch",
+                "theta_true": theta_true,
+                "theta_est": theta_to_dict(self.theta),
+                "loss": loss_parts,
+                "acc": acc_parts,
+                "query_cost": float(qcost),
+                "theta_reg": float(reg_pen),
+                "reward": float(reward),
+            }) + "\n")
+            self._log_f.flush()
+
+            if self.sleep_s > 0:
+                time.sleep(self.sleep_s)
+
+            self.t_ep += 1
+            self.t_global += 1
+            done = bool(term or trunc or (self.t_ep >= self.H))
+            obs_vec = self._sanitize_obs(self._obs_vec(), where="step/gate_insufficient_batch")
+            return obs_vec, float(reward), done, False, {}
+
+        # THETA UPDATE (guarded)
+        th = self.theta
+        if (not self.freeze_theta) and (not skip_theta_update):
+            th.battery_max = float(th.battery_max) + 15.0 * float(action[1])
+            th.step_cost   = float(th.step_cost)   + 0.02 * float(action[2])
+            th.p_slip      = float(th.p_slip)      + 0.01 * float(action[3])
+
+        th.delivery_reward = float(self.theta_prior.delivery_reward)
+        th.battery_fail_penalty = float(self.theta_prior.battery_fail_penalty)
+
+        clamp_theta(th)
+        self.theta = th
+        apply_theta_to_env(self.twin, self.theta)
+
+        reg_pen = float(self._theta_reg_penalty())
+        reward = float(-float(loss_parts.get("loss/total", 0.0)) - qcost - reg_pen - self.step_penalty)
+
+        self.k_used_ep += 1
+        self.k_used_total += 1
+        self.since_query = 0
+        self.update_idx += 1
+
+        log_event = {
+            "event": "oracle_update",
+            "mode": self.mode,
+            "log_mode": self.log_mode,
+            "run_id": getattr(self, "run_id", None),
+            "t_global": int(self.t_global),
+            "update_idx": int(self.update_idx),
+            "ep": int(self.ep),
+            "t_ep": int(self.t_ep),
+            "k_used_ep": int(self.k_used_ep),
+            "k_used_total": int(self.k_used_total),
+            "batch_T": int(T),
+            "theta_true": theta_true,
+            "theta_est": theta_to_dict(self.theta),
+            "loss": loss_parts,
+            "acc": acc_parts,
+            "query_cost": float(qcost),
+            "theta_reg": float(reg_pen),
+            "reward": float(reward),
+        }
+        self._log_f.write(json_dumps_safe(log_event) + "\n")
+
+        if (not LOG_UPDATE_ONLY) and LOG_STEPS:
+            self._log_f.write(json_dumps_safe({
+                "event": "step",
+                "mode": self.mode,
+                "log_mode": self.log_mode,
                 "t_global": int(self.t_global),
                 "ep": int(self.ep),
                 "t_ep": int(self.t_ep),
                 "did_query": 1,
                 "k_used_ep": int(self.k_used_ep),
                 "k_used_total": int(self.k_used_total),
+                "since_query": int(self.since_query),
                 "theta_est": theta_to_dict(self.theta),
-                "theta_true": self.theta_true,
-                "gt_has_pslip": bool(self.gt_has_pslip),
-                "state_err": {
-                    "pos_mse": float(pos_mse),
-                    "bat_mse": float(bat_mse),
-                    "reward_abs_err": float(rew_abs_err),
-                    "loss_new": float(loss_new),
-                    "improvement": float(improvement),
-                    "query_cost": float(qcost),
-                },
-                "theta_metrics": theta_metrics,
                 "reward": float(reward),
-            }
+            }) + "\n")
 
-            if self.sleep_s > 0:
-                import time
-                time.sleep(self.sleep_s)
-        else:
-            self.since_query += 1
-
-        # log step-level record EVERY step
-        step_rec = {
-            "event": "step",
-            "t_global": int(self.t_global),
-            "ep": int(self.ep),
-            "t_ep": int(self.t_ep),
-            "did_query": int(do_query),
-            "k_used_ep": int(self.k_used_ep),
-            "k_used_total": int(self.k_used_total),
-            "since_query": int(self.since_query),
-            "theta_est": theta_to_dict(self.theta),
-            "last_err": [float(x) for x in self.last_err.tolist()],
-            "reward": float(reward),
-        }
-        self._log_f.write(json_dumps_safe(step_rec) + "\n")
-        if update_rec is not None:
-            self._log_f.write(json_dumps_safe(update_rec) + "\n")
         self._log_f.flush()
 
-        # advance time
+        if self.sleep_s > 0:
+            time.sleep(self.sleep_s)
+
         self.t_ep += 1
         self.t_global += 1
-
         done = bool(term or trunc or (self.t_ep >= self.H))
-        return self._obs_vec(), float(reward), done, False, {}
+        obs_vec = self._sanitize_obs(self._obs_vec(), where="step/obs_vec")
+        return obs_vec, float(reward), done, False, {}
 
     def close(self):
         try:
@@ -427,10 +670,10 @@ class ControllerEnv(gym.Env):
             pass
         super().close()
 
+
 def main():
     ORACLE_URL = "http://16.16.126.90:8001"
 
-    # fast debug params
     H = 1000
     K = 200
     TOTAL_STEPS = 50_000
@@ -438,9 +681,12 @@ def main():
     run_id = uuid.uuid4().hex[:8]
     log_path = f"logs/ppo_calib_{run_id}.jsonl"
 
-    # driver model
-    DRIVER_MODEL = "models/ppo_driver_5fffd98de8.zip" 
+    DRIVER_MODEL = "models/ppo_driver_5fffd98de8.zip"
 
+    init_theta = Theta(battery_max=80, step_cost=0.10, delivery_reward=10.0, battery_fail_penalty=8.0, p_slip=0.10)
+    prior_theta = Theta(battery_max=80, step_cost=0.10, delivery_reward=10.0, battery_fail_penalty=8.0, p_slip=0.10)
+
+    # --- TRAIN ENV (writes log_mode='train') ---
     env = ControllerEnv(
         oracle_url=ORACLE_URL,
         driver_model_path=DRIVER_MODEL,
@@ -449,15 +695,48 @@ def main():
         K=K,
         query_every=20,
         sleep_s=0.0,
-        w_pos=1.0,
-        w_bat=1.0,
-        w_rew=0.1,
-        query_cost_base=0.10, 
-        query_cost_freq=0.30, 
+        query_cost_base=0.10,
         step_penalty=0.001,
-        init_theta=Theta(battery_max=80, step_cost=0.10, delivery_reward=10.0, battery_fail_penalty=8.0, p_slip=0.10),
+        theta_reg=0.15,
+        init_theta=init_theta,
+        prior_theta=prior_theta,
+        mode="train",
+        log_mode="train",
+        freeze_theta=False,
     )
-    env.run_id = run_id  #for logging
+    env.run_id = run_id
+
+    # --- EVAL ENV (held-out seeds; writes log_mode='eval') ---
+    eval_env = ControllerEnv(
+        oracle_url=ORACLE_URL,
+        driver_model_path=DRIVER_MODEL,
+        log_path=log_path,  # same jsonl file
+        H=H,
+        K=K,
+        query_every=20,
+        sleep_s=0.0,
+        query_cost_base=0.10,
+        step_penalty=0.001,
+        theta_reg=0.15,
+        init_theta=init_theta,
+        prior_theta=prior_theta,
+        mode="eval",
+        log_mode="eval",
+        freeze_theta=False,  # set True for ablation: policy-only
+    )
+    eval_env.run_id = run_id
+
+    # Choose held-out seeds that won't overlap with your training seeds.
+    # Training seeds are random in [0, 1e7), but to be safe, pick a disjoint high range.
+    EVAL_SEEDS = list(range(50_000_000, 50_000_200))
+
+    callback = CalibEvalCallback(
+        eval_env=eval_env,
+        eval_seeds=EVAL_SEEDS,
+        eval_freq=5000,
+        n_eval_episodes=5,
+        deterministic=True,
+    )
 
     model = PPO(
         "MlpPolicy",
@@ -474,14 +753,18 @@ def main():
     print(f"Training started. Run ID: {run_id}")
     print(f"Logging: {log_path}")
 
-    model.learn(total_timesteps=TOTAL_STEPS)
+    model.learn(total_timesteps=TOTAL_STEPS, callback=callback)
 
     model_file = f"models/ppo_controller_{run_id}.zip"
     model.save(model_file)
+
     env.close()
+    eval_env.close()
 
     print(f"\nDone. Model: {model_file}")
-    print(f"Now run: python plot_ppo_calib_report.py --log {log_path}")
+    print(f"Logs: {log_path}")
+    print("Note: train records have log_mode='train', eval records have log_mode='eval'.")
+
 
 if __name__ == "__main__":
     main()

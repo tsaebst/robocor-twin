@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,9 +11,12 @@ import numpy as np
 import requests
 
 from env import RCConfig, make_env
-from rc_calib.wrappers import SlipActionWrapper
+from wrappers import SlipActionWrapper
 
 
+# -------------------------
+# Oracle client
+# -------------------------
 class RoboCourierOracle:
     def __init__(self, base_url: str, timeout_s: float = 10.0):
         self.base_url = base_url.rstrip("/")
@@ -31,6 +35,9 @@ class RoboCourierOracle:
         return r.json()
 
 
+# -------------------------
+# unwrap + state set
+# -------------------------
 def unwrap_env(env_obj: Any, max_depth: int = 20) -> Any:
     base = env_obj
     for _ in range(max_depth):
@@ -86,6 +93,9 @@ def make_twin_env(theta: Dict[str, Any], init_state: Dict[str, Any], seed: int) 
     return twin
 
 
+# -------------------------
+# Action mapping + coords
+# -------------------------
 def norm_xy_to_grid(xn: float, yn: float, grid_size: int) -> Tuple[int, int]:
     gs = grid_size - 1
     x = int(np.floor(float(xn) * gs + 1e-9))
@@ -155,13 +165,17 @@ def greedy_action_towards(curr: Tuple[int, int], target: Tuple[int, int], act: D
 
 
 def a2_action(obs_twin: np.ndarray, grid_size: int, act_map: Dict[str, int], charge_thresh: float) -> int:
+    """
+    Greedy pickup/deliver, but if battery (normalized) <= charge_thresh => go to charger (C).
+    """
     has = float(obs_twin[6]) > 0.5
     bat = float(obs_twin[7])
 
     rx, ry = obs_to_robot_xy(obs_twin, grid_size)
 
-    # charger
+    # charger location in obs[8:10]
     cx, cy = norm_xy_to_grid(float(obs_twin[8]), float(obs_twin[9]), grid_size)
+
     if bat <= float(charge_thresh):
         tgt = (cx, cy)
     else:
@@ -175,6 +189,9 @@ def a2_action(obs_twin: np.ndarray, grid_size: int, act_map: Dict[str, int], cha
     return greedy_action_towards((rx, ry), tgt, act_map)
 
 
+# -------------------------
+# Metrics on queried points
+# -------------------------
 def _take_at_indices(arr: np.ndarray, idx: List[int]) -> np.ndarray:
     if arr.size == 0 or not idx:
         return np.zeros((0, arr.shape[1]), dtype=np.float32) if arr.ndim == 2 else np.zeros((0,), dtype=float)
@@ -189,6 +206,7 @@ def compute_loss_on_queries(obs_oracle_q: np.ndarray, obs_twin: np.ndarray, quer
     T = min(len(pq), len(tq))
     if T <= 1:
         return {"loss": 1e9, "pos_mse": 1e9, "bat_mse": 1e9}
+
     pos_mse = float(np.mean((pq[:T, 0:2] - tq[:T, 0:2]) ** 2))
     bat_mse = float(np.mean((pq[:T, 7] - tq[:T, 7]) ** 2))
     loss = pos_mse + bat_mse
@@ -204,6 +222,9 @@ def theta_mean_abs(theta: Dict[str, Any], ws_true: Dict[str, Any]) -> float:
     return float(np.mean(diffs)) if diffs else 0.0
 
 
+# -------------------------
+# Random search around current theta
+# -------------------------
 def sample_theta(rng: np.random.Generator, center: Dict[str, Any]) -> Dict[str, Any]:
     th = dict(center)
     th["battery_max"] = int(np.clip(int(center["battery_max"]) + int(rng.integers(-80, 81)), 30, 600))
@@ -253,6 +274,36 @@ def calibrate_episode(
     return best_theta, best_m
 
 
+# -------------------------
+# Logging helpers (standardized)
+# -------------------------
+@dataclass
+class BestSoFar:
+    loss: float = float("inf")
+    pos_mse: float = float("inf")
+    bat_mse: float = float("inf")
+    theta_mean_abs: float = float("inf")
+
+    def update_min(self, m: Dict[str, float], theta_mean_abs: float) -> Dict[str, float]:
+        self.loss = min(self.loss, float(m["loss"]))
+        self.pos_mse = min(self.pos_mse, float(m["pos_mse"]))
+        self.bat_mse = min(self.bat_mse, float(m["bat_mse"]))
+        self.theta_mean_abs = min(self.theta_mean_abs, float(theta_mean_abs))
+        return {
+            "loss_best": self.loss,
+            "pos_mse_best": self.pos_mse,
+            "bat_mse_best": self.bat_mse,
+            "theta_mean_abs_best": self.theta_mean_abs,
+        }
+
+
+def write_jsonl(f, obj: Dict[str, Any]) -> None:
+    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+# -------------------------
+# main
+# -------------------------
 def main():
     ORACLE_URL = "http://16.16.126.90:8001"
 
@@ -266,7 +317,11 @@ def main():
     CHARGE_THRESH = 0.30
     SEED0 = 0
 
-    logs_dir = Path("logs"); logs_dir.mkdir(exist_ok=True)
+    BASELINE_NAME = "A2_greedy_PD_with_charge_scaled"
+    SOURCE = "A2"  # for overlay plots later
+
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
     run_id = uuid.uuid4().hex[:10]
     log_path = logs_dir / f"a2_run_{run_id}.jsonl"
 
@@ -288,11 +343,15 @@ def main():
     total_oracle_steps = 0
     ep = 0
 
+    best = BestSoFar()
+
     with log_path.open("w", encoding="utf-8") as f:
-        f.write(json.dumps({
+        write_jsonl(f, {
             "event": "start",
             "run_id": run_id,
-            "baseline": "A2_greedy_PD_with_charge_scaled",
+            "source": SOURCE,
+            "algo": "baseline",
+            "baseline": BASELINE_NAME,
             "oracle_url": ORACLE_URL,
             "H_TOTAL": H_TOTAL,
             "K_TOTAL": K_TOTAL,
@@ -300,9 +359,10 @@ def main():
             "QUERY_EVERY": QUERY_EVERY,
             "CALIB_TRIALS": CALIB_TRIALS,
             "SLEEP_S": SLEEP_S,
-            "CHARGE_THRESH": CHARGE_THRESH,
+            "CHARGE_THRESH": float(CHARGE_THRESH),
             "init_theta": dict(theta),
-        }, ensure_ascii=False) + "\n")
+            "time_unix": time.time(),
+        })
 
         while total_twin_steps < H_TOTAL:
             seed = SEED0 + ep
@@ -319,20 +379,25 @@ def main():
             obs_t, _ = env.reset(seed=seed)
             obs_t = np.asarray(obs_t, dtype=np.float32)
 
-            f.write(json.dumps({
+            write_jsonl(f, {
                 "event": "episode_start",
                 "run_id": run_id,
+                "source": SOURCE,
+                "algo": "baseline",
+                "baseline": BASELINE_NAME,
                 "ep": ep,
                 "seed": seed,
                 "t_global": total_twin_steps,
                 "k_used_total": total_oracle_steps,
                 "theta": dict(theta),
-            }, ensure_ascii=False) + "\n")
+                "time_unix": time.time(),
+            })
 
             actions: List[int] = []
             query_steps: List[int] = []
             obs_oracle_q: List[np.ndarray] = []
 
+            # include reset obs as query at t=0
             obs_oracle_q.append(np.asarray(reset["obs"], dtype=np.float32))
             query_steps.append(0)
 
@@ -345,27 +410,31 @@ def main():
                     obs_t,
                     grid_size=int(theta["grid_size"]),
                     act_map=act_map,
-                    charge_thresh=CHARGE_THRESH
+                    charge_thresh=CHARGE_THRESH,
                 )
 
                 obs_t, r_t, term, trunc, _ = env.step(int(a))
                 obs_t = np.asarray(obs_t, dtype=np.float32)
                 actions.append(int(a))
 
-                queried = False
+                queried = 0
                 if (total_oracle_steps < K_TOTAL) and (steps_in_ep % QUERY_EVERY == 0):
                     step = oracle.step(sid, int(a))
                     total_oracle_steps += 1
-                    queried = True
+                    queried = 1
                     obs_oracle_q.append(np.asarray(step["obs"], dtype=np.float32))
                     query_steps.append(steps_in_ep + 1)
 
                     if SLEEP_S > 0:
                         time.sleep(float(SLEEP_S))
 
-                f.write(json.dumps({
+                # light step logging
+                write_jsonl(f, {
                     "event": "step",
                     "run_id": run_id,
+                    "source": SOURCE,
+                    "algo": "baseline",
+                    "baseline": BASELINE_NAME,
                     "ep": ep,
                     "seed": seed,
                     "t_global": total_twin_steps,
@@ -373,14 +442,15 @@ def main():
                     "k_used_total": total_oracle_steps,
                     "queried_oracle": int(queried),
                     "action": int(a),
-                    "theta": dict(theta),
-                    "obs_twin": obs_t.tolist(),
                     "reward_twin": float(r_t),
-                }, ensure_ascii=False) + "\n")
+                    "theta": dict(theta),
+                    "time_unix": time.time(),
+                })
 
                 steps_in_ep += 1
                 total_twin_steps += 1
 
+            # calibration update (end of episode)
             if len(obs_oracle_q) >= 2:
                 obs_oracle_q_np = np.stack(obs_oracle_q, axis=0).astype(np.float32)
                 theta_before = dict(theta)
@@ -398,27 +468,49 @@ def main():
                 theta = dict(best_theta)
 
                 acc_theta = theta_mean_abs(theta, ws0)
-                f.write(json.dumps({
+                best_dict = best.update_min(best_m, acc_theta)
+
+                write_jsonl(f, {
                     "event": "calib_update",
                     "run_id": run_id,
+                    "source": SOURCE,
+                    "algo": "baseline",
+                    "baseline": BASELINE_NAME,
                     "ep": ep,
                     "seed": seed,
                     "t_global": total_twin_steps - 1,
                     "k_used_total": total_oracle_steps,
-                    "metrics_after": dict(best_m),
+                    "theta_before": theta_before,   # optional
                     "theta_after": dict(theta),
-                    "acc": {"acc/theta_mean_abs": float(acc_theta)},
-                }, ensure_ascii=False) + "\n")
+                    "metrics": {
+                        "loss": float(best_m["loss"]),
+                        "pos_mse": float(best_m["pos_mse"]),
+                        "bat_mse": float(best_m["bat_mse"]),
+                        "theta_mean_abs": float(acc_theta),
+                        **{k: float(v) for k, v in best_dict.items()},
+                    },
+                    "time_unix": time.time(),
+                })
 
             ep += 1
 
-        f.write(json.dumps({
+        write_jsonl(f, {
             "event": "end",
             "run_id": run_id,
-            "total_twin_steps": total_twin_steps,
-            "total_oracle_steps": total_oracle_steps,
-            "final_theta": theta,
-        }, ensure_ascii=False) + "\n")
+            "source": SOURCE,
+            "algo": "baseline",
+            "baseline": BASELINE_NAME,
+            "total_twin_steps": int(total_twin_steps),
+            "total_oracle_steps": int(total_oracle_steps),
+            "final_theta": dict(theta),
+            "best": {
+                "loss_best": best.loss,
+                "pos_mse_best": best.pos_mse,
+                "bat_mse_best": best.bat_mse,
+                "theta_mean_abs_best": best.theta_mean_abs,
+            },
+            "time_unix": time.time(),
+        })
 
     print("WROTE:", log_path)
 
