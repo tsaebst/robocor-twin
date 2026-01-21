@@ -9,8 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 
+import wandb
+from wandb.integration.sb3 import WandbCallback
+from stable_baselines3.common.callbacks import CallbackList
+
+
 import numpy as np
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 
 from env import RCConfig, make_env
 from src.rc_calib.wrappers import SlipActionWrapper
@@ -28,22 +34,15 @@ from rl_utils import (
 )
 
 # ============================================================
-# NO hardcoding / NO GT leakage:
-# - theta_true is EVAL/LOG ONLY.
-# - policy observation/reward/cost use ONLY disagreement metrics:
-#   loss_parts + (pos_mse, bat_mse, rew_mae) computed WITHOUT theta_true.
-#
-# Stability upgrades:
-# - online normalization (RunningMeanStd) for last_signals.
-# - annealed prior reg + annealed update scales.
-# - smoothness penalties for all calibrated params.
-# - generic bounds barrier (prevents sticking to clamp edges).
+# Logging contract (for plotting):
+#  - every record has: "_x" (t_global) and "log_mode" in {"train","eval","burnin"}
+#  - "theta_true_eval_only" is logged only on reset/eval (not used in policy)
 # ============================================================
 
 LOSS_WEIGHTS = {
     "pos": 1.0,
     "bat": 2.0,
-    "rew": 0.2,   # keep low (rew easiest to soak)
+    "rew": 0.2,
     "term": 1.0,
     "slip": 0.5,
     "param_reg": 0.0,
@@ -51,12 +50,9 @@ LOSS_WEIGHTS = {
 CALIB_BATCH_LEN = 32
 HUBER_DELTA = 1.0
 
-# Normalization scales (NOT GT; just stable units for obs/penalties)
 NORM_BATTERY_MAX = 400.0
 NORM_STEP_COST = 0.50
 NORM_P_SLIP = 0.30
-
-# For bounds barrier: normalized margin near edges [0,1]
 DEFAULT_BOUNDS_EPS = 0.08
 
 
@@ -131,10 +127,6 @@ class RingBuffer:
 
 
 class RunningMeanStd:
-    """
-    Online mean/std (Welford) for vector signals.
-    Used to normalize last_signals fed to the policy.
-    """
     def __init__(self, shape: Tuple[int, ...], eps: float = 1e-8):
         self.shape = tuple(shape)
         self.eps = float(eps)
@@ -166,18 +158,6 @@ class RunningMeanStd:
 
 
 class ControllerEnv(gym.Env):
-    """
-    PPO action:
-      action[0] = query gate
-      action[1] = delta battery_max
-      action[2] = delta step_cost
-      action[3] = delta p_slip
-
-    NO GT leakage:
-      - theta_true is logged only.
-      - policy uses ONLY loss_parts + acc parts computed with EMPTY theta_true.
-    """
-
     metadata = {"render_modes": []}
 
     def __init__(
@@ -192,7 +172,6 @@ class ControllerEnv(gym.Env):
         sleep_s: float = 0.0,
         query_cost_base: float = 0.10,
         step_penalty: float = 0.001,
-        # prior regularization (annealed)
         theta_reg: float = 0.25,
         theta_reg_final_frac: float = 0.10,
         theta_reg_battery_mult: float = 0.25,
@@ -203,28 +182,24 @@ class ControllerEnv(gym.Env):
         prior_theta: Optional[Theta] = None,
         curriculum_steps: int = 50_000,
         curriculum_stages: Optional[List[Dict[str, Any]]] = None,
-        # update scales (annealed)
         delta_battery_scale: float = 12.0,
         delta_step_cost_scale: float = 0.010,
         delta_pslip_scale: float = 0.010,
         delta_min_frac: float = 0.20,
         delta_anneal_power: float = 1.0,
-        # smoothness penalties (normalized)
         battery_smooth_w: float = 0.30,
         step_cost_smooth_w: float = 0.50,
         pslip_smooth_w: float = 0.20,
-        # bounds barrier
         bounds_barrier_w: float = 0.25,
         bounds_barrier_eps: float = DEFAULT_BOUNDS_EPS,
-        # query budget schedule
         k_min_late: int = 10,
         k_decay_power: float = 2.0,
-        # signal normalization
         normalize_signals: bool = True,
         signals_clip: float = 5.0,
-        # query cost shaping
-        query_time_shaping: bool = True,   # if False => no exp(3p); mostly error-based
-        query_time_exp_k: float = 3.0,     # exp(k * p) if enabled
+        query_time_shaping: bool = True,
+        query_time_exp_k: float = 3.0,
+        # IMPORTANT: logging modes
+        log_mode: str = "train",
     ):
         super().__init__()
         self.oracle = RoboCourierOracle(oracle_url)
@@ -275,6 +250,7 @@ class ControllerEnv(gym.Env):
 
         self.normalize_signals = bool(normalize_signals)
         self.signals_clip = float(signals_clip)
+        # NOTE: DO NOT reset every episode; keep global stationarity for PPO.
         self._signals_rms = RunningMeanStd(shape=(8,))
 
         self.query_time_shaping = bool(query_time_shaping)
@@ -282,56 +258,36 @@ class ControllerEnv(gym.Env):
 
         if curriculum_stages is None:
             self.curriculum_stages = [
-                {
-                    "name": "stage0_easy_no_slip",
-                    "until_frac": 0.30,
-                    "slip_enabled": False,
-                    "allow_pslip_update": False,
-                    "query_every": self.query_every_base,
-                },
-                {
-                    "name": "stage1_slip_on_pslip_frozen",
-                    "until_frac": 0.70,
-                    "slip_enabled": True,
-                    "allow_pslip_update": False,
-                    "query_every": max(10, self.query_every_base),
-                },
-                {
-                    "name": "stage2_full",
-                    "until_frac": 1.01,
-                    "slip_enabled": True,
-                    "allow_pslip_update": True,
-                    "query_every": max(20, self.query_every_base),
-                },
+                {"name": "stage0_easy_no_slip", "until_frac": 0.30, "slip_enabled": False, "allow_pslip_update": False, "query_every": self.query_every_base},
+                {"name": "stage1_slip_on_pslip_frozen", "until_frac": 0.70, "slip_enabled": True,  "allow_pslip_update": False, "query_every": max(10, self.query_every_base)},
+                {"name": "stage2_full", "until_frac": 1.01, "slip_enabled": True,  "allow_pslip_update": True,  "query_every": max(20, self.query_every_base)},
             ]
         else:
             self.curriculum_stages = curriculum_stages
 
-        # Logging
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_f = self.log_path.open("w", encoding="utf-8")
 
-        # action mapping
+        # line-buffered to avoid "0 bytes" if crash
+        self._log_f = self.log_path.open("w", encoding="utf-8", buffering=1)
+
+        self.log_mode = str(log_mode)
+
         self.act_map = infer_action_mapping_local(seed=self.seed0)
 
-        # driver model
         self.driver_is_heuristic = (driver_model_path is None)
         self.driver_model = PPO.load(driver_model_path) if (not self.driver_is_heuristic) else None
 
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
 
         # Observation: 10 + 3 + 1 + 1 + 8 + 1 + 1 = 25
-        self.observation_space = gym.spaces.Box(
-            low=-10.0, high=10.0, shape=(10 + 3 + 1 + 1 + 8 + 1 + 1,), dtype=np.float32
-        )
+        self.observation_space = gym.spaces.Box(low=-10.0, high=10.0, shape=(25,), dtype=np.float32)
 
         self.theta = init_theta if init_theta is not None else Theta()
         self.theta_prior = prior_theta if prior_theta is not None else Theta(
             battery_max=80, step_cost=0.10, delivery_reward=10.0, battery_fail_penalty=8.0, p_slip=0.10
         )
 
-        # runtime state
         self.sid: Optional[str] = None
         self.grid_size: int = 10
 
@@ -344,19 +300,15 @@ class ControllerEnv(gym.Env):
         self.since_query = 10**9
         self.update_idx = 0
 
-        # last_signals: [pos_mse, bat_mse, rew_mae, loss_pos, loss_bat, loss_rew, loss_term, loss_total]
         self.last_signals = np.zeros((8,), dtype=np.float32)
-
         self.obs_t: Optional[np.ndarray] = None
         self.twin = None
 
-        # GT: EVAL/LOG ONLY
+        # GT: eval/log only
         self.theta_true: Dict[str, Any] = {}
         self.gt_has_pslip: bool = False
 
         self.pair_buf = RingBuffer(capacity=max(256, self.batch_len * 4))
-
-        # curriculum cache
         self._curr_stage_idx = 0
         self._curr_stage_name = "unknown"
         self._curr_slip_enabled = True
@@ -364,6 +316,18 @@ class ControllerEnv(gym.Env):
         self._curr_query_every = self.query_every_base
 
         self.prev_loss_total: Optional[float] = None
+
+    # ---------------- internal logging ----------------
+    def _log(self, rec: Dict[str, Any]) -> None:
+        rec = dict(rec)
+        rec.setdefault("run_id", getattr(self, "run_id", None))
+        rec.setdefault("log_mode", self.log_mode)
+        rec.setdefault("_x", int(self.t_global))
+        rec.setdefault("t_global", int(self.t_global))
+        rec.setdefault("ep", int(self.ep))
+        rec.setdefault("t_ep", int(self.t_ep))
+        self._log_f.write(json_dumps_safe(rec) + "\n")
+        self._log_f.flush()
 
     # ---------------- schedules ----------------
     def _progress_frac(self) -> float:
@@ -410,31 +374,12 @@ class ControllerEnv(gym.Env):
 
         self._update_effective_budget()
 
-    # ---------------- obs / masking ----------------
+    # ---------------- query / obs ----------------
     def _query_allowed(self) -> bool:
         return (self.since_query >= int(self._curr_query_every)) and (self.k_used_ep < int(self.K_eff))
 
     def _query_mask_scalar(self) -> float:
         return 1.0 if self._query_allowed() else 0.0
-
-    def _sanitize_obs(self, vec: np.ndarray, where: str) -> np.ndarray:
-        vec = np.asarray(vec, dtype=np.float32)
-        if np.all(np.isfinite(vec)):
-            return vec
-        bad = np.where(~np.isfinite(vec))[0].tolist()
-        rec = {
-            "event": "warning",
-            "where": where,
-            "t_global": int(self.t_global),
-            "ep": int(self.ep),
-            "t_ep": int(self.t_ep),
-            "bad_idx": bad,
-            "theta_est": theta_to_dict(self.theta),
-            "last_signals": [float(x) for x in np.nan_to_num(self.last_signals).tolist()],
-        }
-        self._log_f.write(json_dumps_safe(rec) + "\n")
-        self._log_f.flush()
-        return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
     def _make_twin(self, seed: int) -> Any:
         cfg = RCConfig(
@@ -475,11 +420,11 @@ class ControllerEnv(gym.Env):
 
         sig = self.last_signals
         if self.normalize_signals:
-            # normalize signals online (helps PPO a lot)
             sig = self._signals_rms.normalize(sig, clip=self.signals_clip)
 
         obs = np.asarray(self.obs_t, dtype=np.float32)
         vec = np.concatenate([obs, theta_vec, budget_frac, since_q, sig, qmask, stage], axis=0)
+        vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         return vec
 
     def _driver_action(self, obs_t: np.ndarray) -> int:
@@ -488,7 +433,7 @@ class ControllerEnv(gym.Env):
         a, _ = self.driver_model.predict(obs_t, deterministic=True)
         return int(a)
 
-    # ---------------- penalties (NO GT) ----------------
+    # ---------------- penalties ----------------
     def _theta_reg_penalty(self) -> float:
         w = self._annealed_theta_reg_weight()
         th = self.theta
@@ -498,14 +443,7 @@ class ControllerEnv(gym.Env):
         ds = ((float(th.step_cost) - float(pr.step_cost)) / NORM_STEP_COST) ** 2
         dp = ((float(th.p_slip) - float(pr.p_slip)) / NORM_P_SLIP) ** 2
 
-        return float(
-            w
-            * (
-                self.theta_reg_battery_mult * db
-                + self.theta_reg_step_mult * ds
-                + self.theta_reg_pslip_mult * dp
-            )
-        )
+        return float(w * (self.theta_reg_battery_mult * db + self.theta_reg_step_mult * ds + self.theta_reg_pslip_mult * dp))
 
     def _smoothness_penalties(self) -> Dict[str, float]:
         th = self.theta
@@ -550,25 +488,17 @@ class ControllerEnv(gym.Env):
         pen = hinge_margin(bxn) + hinge_margin(sxn) + hinge_margin(pxn)
         return float(self.bounds_barrier_w * pen)
 
-    # ---------------- query cost schedule ----------------
+    # ---------------- query cost ----------------
     def _adaptive_query_cost(self, acc_parts_no_gt: Dict[str, float], loss_parts: Dict[str, float]) -> float:
         pos_mse = float(acc_parts_no_gt.get("acc/pos_mse", 0.0) or 0.0)
         bat_mse = float(acc_parts_no_gt.get("acc/bat_mse", 0.0) or 0.0)
         rew_mae = float(acc_parts_no_gt.get("acc/rew_mae", 0.0) or 0.0)
         loss_total = float(loss_parts.get("loss/total", 0.0) or 0.0)
 
-        bad = 0.0
-        bad += 0.08 * pos_mse
-        bad += 0.12 * bat_mse
-        bad += 0.15 * rew_mae
-        bad += 0.25 * loss_total
+        bad = 0.08 * pos_mse + 0.12 * bat_mse + 0.15 * rew_mae + 0.25 * loss_total
 
         p = self._progress_frac()
-        if self.query_time_shaping:
-            late_mult = float(math.exp(self.query_time_exp_k * p))
-        else:
-            # softer, mostly data-driven
-            late_mult = 1.0 + 2.0 * p
+        late_mult = float(math.exp(self.query_time_exp_k * p)) if self.query_time_shaping else (1.0 + 2.0 * p)
 
         rem = float(self.K_eff - self.k_used_ep) / max(1.0, float(self.K_eff))
         budget_mult = 1.0 + 3.0 * ((1.0 - rem) ** 2)
@@ -598,7 +528,6 @@ class ControllerEnv(gym.Env):
 
         self.pair_buf = RingBuffer(capacity=max(256, self.batch_len * 4))
         self.last_signals = np.zeros((8,), dtype=np.float32)
-        self._signals_rms = RunningMeanStd(shape=(8,))  # reset normalization per-run/episode for stability
 
         self._apply_curriculum()
 
@@ -611,7 +540,7 @@ class ControllerEnv(gym.Env):
         self.theta.use_stay = bool(ws.get("use_stay", self.theta.use_stay))
         clamp_theta(self.theta)
 
-        # GT subset (EVAL ONLY)
+        # GT subset (EVAL/LOG only)
         bm = ws.get("battery_max", None)
         sc = ws.get("step_cost", None)
         ps = ws.get("p_slip", None)
@@ -625,20 +554,16 @@ class ControllerEnv(gym.Env):
         if self.gt_has_pslip:
             self.theta_true["p_slip"] = float(ps)
 
-        # curriculum enforcement
         if not self._curr_slip_enabled:
             self.theta.p_slip = 0.0
             clamp_theta(self.theta)
 
-        # twin reset
         self.twin = self._make_twin(seed=seed)
         obs0, _ = self.twin.reset(seed=seed)
         self.obs_t = np.asarray(obs0, dtype=np.float32)
 
-        self._log_f.write(json_dumps_safe({
+        self._log({
             "event": "reset",
-            "run_id": getattr(self, "run_id", None),
-            "ep": int(self.ep),
             "seed": int(seed),
             "theta_true_eval_only": dict(self.theta_true),
             "theta_est": theta_to_dict(self.theta),
@@ -650,18 +575,15 @@ class ControllerEnv(gym.Env):
                 "allow_pslip_update": bool(self._curr_allow_pslip_update),
                 "query_every": int(self._curr_query_every),
             },
-        }) + "\n")
-        self._log_f.flush()
+        })
 
-        obs_vec = self._sanitize_obs(self._obs_vec(), where="reset/obs_vec")
-        return obs_vec, {}
+        return self._obs_vec(), {}
 
     def step(self, action: np.ndarray):
         self._apply_curriculum()
 
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         q_raw = float(action[0])
-
         if not self._query_allowed():
             q_raw = -1.0
         do_query = int(q_raw > 0.0)
@@ -677,15 +599,16 @@ class ControllerEnv(gym.Env):
         obs_t2 = np.asarray(obs_t2, dtype=np.float32)
         self.obs_t = obs_t2
 
+        # baseline step penalty always
         reward = -float(self.step_penalty)
 
+        # no-query path
         if not do_query:
             self.since_query += 1
             self.t_ep += 1
             self.t_global += 1
             done = bool(term or trunc or (self.t_ep >= self.H))
-            obs_vec = self._sanitize_obs(self._obs_vec(), where="step/no_query_obs_vec")
-            return obs_vec, float(reward), done, False, {}
+            return self._obs_vec(), float(reward), done, False, {}
 
         # query path
         resp = self.oracle.step(self.sid, int(a_move))
@@ -727,18 +650,12 @@ class ControllerEnv(gym.Env):
         )
 
         theta_est = theta_to_dict(self.theta)
-
-        # Loss is GT-free by design.
         loss_parts = compute_loss_components(batch, theta_est, self.loss_weights, huber_delta=self.huber_delta)
         base_total = float(loss_parts.get("loss/total", 0.0) or 0.0)
 
-        # CRITICAL: compute policy-facing acc WITHOUT GT (empty dict).
-        acc_no_gt = compute_accuracy_metrics(batch, theta_est, {})  # <-- no GT leakage
-
-        # Optional: compute eval acc with GT for logging only.
+        acc_no_gt = compute_accuracy_metrics(batch, theta_est, {})
         acc_eval = compute_accuracy_metrics(batch, theta_est, dict(self.theta_true))
 
-        # update last_signals for policy (NO GT-derived theta errors)
         new_signals = np.array([
             float(acc_no_gt.get("acc/pos_mse", 0.0) or 0.0),
             float(acc_no_gt.get("acc/bat_mse", 0.0) or 0.0),
@@ -750,14 +667,13 @@ class ControllerEnv(gym.Env):
             float(base_total),
         ], dtype=np.float32)
 
-        # update RMS before using in next obs
         if self.normalize_signals:
             self._signals_rms.update(new_signals)
-
         self.last_signals = new_signals
 
         qcost = float(self._adaptive_query_cost(acc_no_gt, loss_parts))
 
+        # not enough batch => do not update theta
         if T < int(self.min_T):
             reg_pen = float(self._theta_reg_penalty())
             bnd_pen = float(self._bounds_barrier_penalty())
@@ -768,19 +684,14 @@ class ControllerEnv(gym.Env):
             self.since_query = 0
             self.update_idx += 1
 
-            self._log_f.write(json_dumps_safe({
+            self._log({
                 "event": "oracle_update_skipped",
-                "run_id": getattr(self, "run_id", None),
-                "t_global": int(self.t_global),
                 "update_idx": int(self.update_idx),
-                "ep": int(self.ep),
-                "t_ep": int(self.t_ep),
                 "k_used_ep": int(self.k_used_ep),
                 "k_used_total": int(self.k_used_total),
                 "K_eff": int(self.K_eff),
                 "batch_T": int(T),
                 "reason": "insufficient_batch",
-                "theta_true_eval_only": dict(self.theta_true),
                 "theta_est": theta_to_dict(self.theta),
                 "loss": loss_parts,
                 "acc_no_gt": acc_no_gt,
@@ -791,8 +702,7 @@ class ControllerEnv(gym.Env):
                 "reward": float(reward),
                 "curriculum_stage": self._curr_stage_name,
                 "query_mask": float(self._query_mask_scalar()),
-            }) + "\n")
-            self._log_f.flush()
+            })
 
             if self.sleep_s > 0:
                 time.sleep(self.sleep_s)
@@ -800,8 +710,7 @@ class ControllerEnv(gym.Env):
             self.t_ep += 1
             self.t_global += 1
             done = bool(term or trunc or (self.t_ep >= self.H))
-            obs_vec = self._sanitize_obs(self._obs_vec(), where="step/gate_insufficient_batch")
-            return obs_vec, float(reward), done, False, {}
+            return self._obs_vec(), float(reward), done, False, {}
 
         # loss explode gate
         skip_theta_update = False
@@ -831,14 +740,7 @@ class ControllerEnv(gym.Env):
         smooth = self._smoothness_penalties()
         bnd_pen = float(self._bounds_barrier_penalty())
 
-        total_obj = float(
-            base_total
-            + reg_pen
-            + bnd_pen
-            + smooth["battery_smooth"]
-            + smooth["step_cost_smooth"]
-            + smooth["pslip_smooth"]
-        )
+        total_obj = float(base_total + reg_pen + bnd_pen + smooth["battery_smooth"] + smooth["step_cost_smooth"] + smooth["pslip_smooth"])
         reward = float(-total_obj - qcost - self.step_penalty)
 
         self.k_used_ep += 1
@@ -846,18 +748,13 @@ class ControllerEnv(gym.Env):
         self.since_query = 0
         self.update_idx += 1
 
-        self._log_f.write(json_dumps_safe({
+        self._log({
             "event": "oracle_update",
-            "run_id": getattr(self, "run_id", None),
-            "t_global": int(self.t_global),
             "update_idx": int(self.update_idx),
-            "ep": int(self.ep),
-            "t_ep": int(self.t_ep),
             "k_used_ep": int(self.k_used_ep),
             "k_used_total": int(self.k_used_total),
             "K_eff": int(self.K_eff),
             "batch_T": int(T),
-            "theta_true_eval_only": dict(self.theta_true),
             "theta_est": theta_to_dict(self.theta),
             "loss": loss_parts,
             "acc_no_gt": acc_no_gt,
@@ -871,8 +768,8 @@ class ControllerEnv(gym.Env):
             "reward": float(reward),
             "curriculum_stage": self._curr_stage_name,
             "query_mask": float(self._query_mask_scalar()),
-        }) + "\n")
-        self._log_f.flush()
+            "skip_theta_update": bool(skip_theta_update),
+        })
 
         if self.sleep_s > 0:
             time.sleep(self.sleep_s)
@@ -880,36 +777,136 @@ class ControllerEnv(gym.Env):
         self.t_ep += 1
         self.t_global += 1
         done = bool(term or trunc or (self.t_ep >= self.H))
-        obs_vec = self._sanitize_obs(self._obs_vec(), where="step/obs_vec")
-        return obs_vec, float(reward), done, False, {}
+        return self._obs_vec(), float(reward), done, False, {}
 
     def close(self):
         try:
+            self._log_f.flush()
             self._log_f.close()
         except Exception:
             pass
         super().close()
 
 
+# -------- burn-in --------
 def burn_in_rollout(env: ControllerEnv, steps: int, seed: int = 0) -> None:
-    """
-    Burn-in (NO PPO learning):
-      - Query aggressively to fill buffer + stabilize signals
-      - Tiny deltas to avoid poisoning.
-    """
     rng = np.random.default_rng(seed)
+    env.log_mode = "burnin"
     obs, _ = env.reset(seed=seed)
-
     for _ in range(int(steps)):
         q_raw = 1.0
         a1 = float(np.clip(rng.normal(0.0, 0.05), -1.0, 1.0))
         a2 = float(np.clip(rng.normal(0.0, 0.05), -1.0, 1.0))
         a3 = float(np.clip(rng.normal(0.0, 0.05), -1.0, 1.0))
-
         act = np.array([q_raw, a1, a2, a3], dtype=np.float32)
         obs, r, done, _, _ = env.step(act)
         if done:
             obs, _ = env.reset(seed=int(rng.integers(0, 10**7)))
+    env.log_mode = "train"
+
+
+# -------- periodic eval callback (ensures "eval" curves exist) --------
+class PeriodicEvalCallback(BaseCallback):
+    def __init__(
+        self,
+        eval_env: ControllerEnv,
+        eval_interval_steps: int = 5000,
+        eval_episodes: int = 3,
+        deterministic: bool = True,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose=verbose)
+        self.eval_env = eval_env
+        self.eval_interval_steps = int(eval_interval_steps)
+        self.eval_episodes = int(eval_episodes)
+        self.deterministic = bool(deterministic)
+        self._next = int(eval_interval_steps)
+
+    def _on_step(self) -> bool:
+        # called frequently; keep it cheap
+        if self.num_timesteps < self._next:
+            return True
+        self._next += self.eval_interval_steps
+
+        # run eval episodes (no learning)
+        self.eval_env.log_mode = "eval"
+        ep_summ = []
+        for _ in range(self.eval_episodes):
+            obs, _ = self.eval_env.reset(seed=int(np.random.randint(0, 10**7)))
+            done = False
+            ep_ret = 0.0
+            steps = 0
+            while not done and steps < self.eval_env.H:
+                act, _ = self.model.predict(obs, deterministic=self.deterministic)
+                obs, r, done, _, _ = self.eval_env.step(act)
+                ep_ret += float(r)
+                steps += 1
+            ep_summ.append({"eval_return": ep_ret, "eval_steps": steps})
+
+        # write a compact eval summary record
+        self.eval_env._log({
+            "event": "eval_summary",
+            "sb3_num_timesteps": int(self.num_timesteps),
+            "episodes": ep_summ,
+            "theta_est": theta_to_dict(self.eval_env.theta),
+            "theta_true_eval_only": dict(self.eval_env.theta_true),
+            "k_used_total": int(self.eval_env.k_used_total),
+        })
+        self.eval_env.log_mode = "train"
+        return True
+
+class WandbEnvMetricsCallback(BaseCallback):
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose=verbose)
+
+    def _get_env0(self):
+        env = self.training_env
+        # VecEnv: беремо перше середовище
+        if hasattr(env, "envs"):
+            return env.envs[0]
+        return env
+
+    def _on_step(self) -> bool:
+        env0 = self._get_env0()
+
+        # Твої ключові лічильники/стани
+        data = {
+            "calib/K_eff": getattr(env0, "K_eff", None),
+            "calib/k_used_ep": getattr(env0, "k_used_ep", None),
+            "calib/k_used_total": getattr(env0, "k_used_total", None),
+            "calib/since_query": getattr(env0, "since_query", None),
+            "calib/stage_idx": getattr(env0, "_curr_stage_idx", None),
+        }
+
+        # last_signals: [pos_mse, bat_mse, rew_mae, loss_pos, loss_bat, loss_rew, loss_term, loss_total]
+        ls = getattr(env0, "last_signals", None)
+        if ls is not None and len(ls) == 8:
+            data.update({
+                "calib/pos_mse_no_gt": float(ls[0]),
+                "calib/bat_mse_no_gt": float(ls[1]),
+                "calib/rew_mae_no_gt": float(ls[2]),
+                "calib/loss_pos": float(ls[3]),
+                "calib/loss_bat": float(ls[4]),
+                "calib/loss_rew": float(ls[5]),
+                "calib/loss_term": float(ls[6]),
+                "calib/loss_total": float(ls[7]),
+            })
+
+        # theta_est (не GT)
+        th = getattr(env0, "theta", None)
+        if th is not None:
+            data.update({
+                "theta/battery_max": float(getattr(th, "battery_max", 0.0)),
+                "theta/step_cost": float(getattr(th, "step_cost", 0.0)),
+                "theta/p_slip": float(getattr(th, "p_slip", 0.0)),
+            })
+
+        # пишемо в SB3 logger => воно піде в TensorBoard => і в W&B (sync_tensorboard=True)
+        for k, v in data.items():
+            if v is not None:
+                self.logger.record(k, v)
+
+        return True
 
 
 def main():
@@ -951,25 +948,69 @@ def main():
         bounds_barrier_eps=0.08,
         k_min_late=10,
         k_decay_power=2.0,
-        normalize_signals=True,     # важлива стабілізація
+        normalize_signals=True,
         signals_clip=5.0,
-        query_time_shaping=True,    # можна вимкнути для "більш RL, менше schedule"
+        query_time_shaping=True,
         query_time_exp_k=3.0,
         init_theta=init_theta,
         prior_theta=prior_theta,
         curriculum_steps=TOTAL_STEPS,
+        log_mode="train",
     )
     env.run_id = run_id
 
+    # Create a separate eval env that logs "eval"
+    eval_env = ControllerEnv(
+        oracle_url=ORACLE_URL,
+        driver_model_path=DRIVER_MODEL,
+        log_path=log_path,  # same file; different log_mode
+        H=H,
+        K=K,
+        query_every=20,
+        sleep_s=0.0,
+        query_cost_base=0.10,
+        step_penalty=0.001,
+        theta_reg=0.25,
+        theta_reg_final_frac=0.10,
+        theta_reg_battery_mult=0.25,
+        delta_step_cost_scale=0.010,
+        delta_min_frac=0.20,
+        delta_anneal_power=1.0,
+        battery_smooth_w=0.30,
+        step_cost_smooth_w=0.50,
+        pslip_smooth_w=0.20,
+        bounds_barrier_w=0.25,
+        bounds_barrier_eps=0.08,
+        k_min_late=10,
+        k_decay_power=2.0,
+        normalize_signals=True,
+        signals_clip=5.0,
+        query_time_shaping=True,
+        query_time_exp_k=3.0,
+        init_theta=Theta(**theta_to_dict(init_theta)),
+        prior_theta=prior_theta,
+        curriculum_steps=TOTAL_STEPS,
+        log_mode="eval",
+    )
+    eval_env.run_id = run_id
+
     print(f"Run ID: {run_id}")
     print(f"Logging: {log_path}")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write('{"event":"test_connection"}\n')
-    print("Test record written.")
 
+    env._log({"event": "run_start", "notes": "train/eval logging enabled via log_mode + _x"})
     print(f"Burn-in rollout: {BURN_IN_STEPS} steps (no PPO learning)")
     burn_in_rollout(env, steps=BURN_IN_STEPS, seed=env.seed0)
+    env._log({"event": "burnin_done"})
     print("Burn-in done.")
+    
+    wandb_run = wandb.init(
+    project="robocourier-calib",
+    name=f"ppo_controller_{run_id}",
+    config={"algo": "PPO","total_steps": TOTAL_STEPS,"burn_in_steps": BURN_IN_STEPS,"H": H,"K": K,"query_every": 20,"learning_rate": 2e-4,"n_steps": 512,"batch_size": 64,"n_epochs": 5,"gamma": 0.99,"gae_lambda": 0.95,"ent_coef": 0.01,"theta_reg": 0.25,"bounds_barrier_w": 0.25,"delta_step_cost_scale": 0.010,},
+    tags=["ppo", "calibration", "no-gt-leakage"],
+    sync_tensorboard=True,   # SB3 пише TB — W&B синхронізує
+    save_code=True,)
+
 
     model = PPO(
         "MlpPolicy",
@@ -983,20 +1024,33 @@ def main():
         gae_lambda=0.95,
         ent_coef=0.01,
     )
+    wandb_cb = WandbCallback(
+    gradient_save_freq=0,     # 0 = не логати градієнти (дешевше/швидше)
+    model_save_path=f"models/wandb/{run_id}",
+    model_save_freq=10_000,   # кожні N кроків
+    verbose=0,)
 
+
+    eval_cb = PeriodicEvalCallback(eval_env, eval_interval_steps=5000, eval_episodes=3, deterministic=True)
+    env_metrics_cb = WandbEnvMetricsCallback()
     print(f"Training started. Total timesteps: {TOTAL_STEPS}")
-    model.learn(total_timesteps=TOTAL_STEPS)
+    callback = CallbackList([eval_cb, env_metrics_cb, wandb_cb])
+    model.learn(total_timesteps=TOTAL_STEPS, callback=callback)
 
     model_file = f"models/ppo_controller_{run_id}.zip"
     model.save(model_file)
+	
+    env._log({"event": "train_done", "model_file": model_file})
     env.close()
+    eval_env.close()
+    wandb.finish()
 
     print(f"\nDone. Model: {model_file}")
     print(f"Now plot: {log_path}")
     print("Notes:")
-    print(" - GT leakage removed: policy acc is computed with empty theta_true (acc_no_gt).")
-    print(" - acc_eval uses theta_true only for logging/evaluation.")
-    print(" - last_signals are online-normalized for stable PPO learning.")
+    print(" - log_mode + _x added => train/eval curves will both appear.")
+    print(" - eval_summary records added periodically.")
+    print(" - RMS is global (not reset per episode) => more stable PPO.")
 
 
 if __name__ == "__main__":
